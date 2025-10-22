@@ -31,6 +31,10 @@ TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 
 # OAuth токен Яндекс.Диска
 YANDEX_DISK_TOKEN=y0_AgAAAAxxxxxxxxxxxxxxxxxxxxxxx
+
+# Белый список пользователей (User ID через запятую)
+# Пустое значение или отсутствие = бот доступен всем
+ALLOWED_USER_IDS=123456789,987654321
 ```
 
 ### Как это работает
@@ -40,14 +44,18 @@ Docker Compose автоматически преобразует перемен�
 ```bash
 TELEGRAM_BOT_TOKEN  →  TelegramBot:Token
 YANDEX_DISK_TOKEN   →  YandexDisk:Token
+ALLOWED_USER_IDS    →  TelegramBot:AllowedUserIds (парсится как строка через запятую)
 ```
 
 Это настроено в `docker-compose.yml`:
 ```yaml
 environment:
   - TelegramBot__Token=${TELEGRAM_BOT_TOKEN}
+  - TelegramBot__AllowedUserIds=${ALLOWED_USER_IDS:-}
   - YandexDisk__Token=${YANDEX_DISK_TOKEN}
 ```
+
+**Примечание:** `${ALLOWED_USER_IDS:-}` означает, что если переменная не задана, используется пустое значение.
 
 ---
 
@@ -64,7 +72,8 @@ cp appsettings.Development.json.example appsettings.Development.json
 ```json
 {
   "TelegramBot": {
-    "Token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+    "Token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
+    "AllowedUserIds": []  // Пустой массив = доступ всем
   },
   "YandexDisk": {
     "Token": "y0_AgAAAAxxxxxxxxxxxxxxxxxxxxxxx",
@@ -80,7 +89,8 @@ cp appsettings.Development.json.example appsettings.Development.json
 ```json
 {
   "TelegramBot": {
-    "Token": "ваш_токен"
+    "Token": "ваш_токен",
+    "AllowedUserIds": [123456789, 987654321]  // Белый список (пусто = доступ всем)
   },
   "YandexDisk": {
     "Token": "ваш_токен",
@@ -217,6 +227,7 @@ environment:
 
 - 🚀 [QUICKSTART.md](QUICKSTART.md) - пошаговая инструкция по запуску
 - 📖 [README.md](README.md) - обзор проекта
+- 🏗️ [ARCHITECTURE.md](ARCHITECTURE.md) - архитектура и принципы проектирования
 - 🐳 [docker-compose.yml](docker-compose.yml) - конфигурация Docker
 - 📝 [appsettings.json](appsettings.json) - базовая конфигурация
 

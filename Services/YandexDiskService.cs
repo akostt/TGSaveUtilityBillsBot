@@ -1,25 +1,31 @@
-using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
+using TGSaveUtilityBillsBot.Configuration;
+using TGSaveUtilityBillsBot.Interfaces;
 using TGSaveUtilityBillsBot.Models;
 
 namespace TGSaveUtilityBillsBot.Services;
 
-public class YandexDiskService
+public class YandexDiskService : IYandexDiskService
 {
     private readonly string _token;
     private readonly string _rootFolder;
     private readonly HttpClient _httpClient;
+    private readonly ILogger<YandexDiskService> _logger;
     private const string ApiBaseUrl = "https://cloud-api.yandex.net/v1/disk/resources";
 
-    public YandexDiskService(string token, string rootFolder)
+    public YandexDiskService(IOptions<YandexDiskOptions> options, ILogger<YandexDiskService> logger)
     {
-        _token = token;
-        _rootFolder = rootFolder;
+        var config = options.Value;
+        _token = config.Token;
+        _rootFolder = config.RootFolder;
+        _logger = logger;
         _httpClient = new HttpClient();
         _httpClient.DefaultRequestHeaders.Add("Authorization", $"OAuth {_token}");
     }
 
-    public async Task<bool> UploadFileAsync(BillMetadata metadata, Stream fileStream, string fileName)
+    public async Task<bool> UploadFileAsync(BillMetadata metadata, Stream fileStream, string fileName, bool overwrite = false)
     {
         try
         {
@@ -32,8 +38,14 @@ public class YandexDiskService
             // Полный путь к файлу
             var filePath = $"{folderPath}/{fileName}";
 
+            // Если нужна перезапись - сначала удаляем существующий файл
+            if (overwrite)
+            {
+                await DeleteFileAsync(filePath);
+            }
+
             // Получаем URL для загрузки
-            var uploadUrl = await GetUploadUrlAsync(filePath);
+            var uploadUrl = await GetUploadUrlAsync(filePath, false);
             if (string.IsNullOrEmpty(uploadUrl))
             {
                 return false;
@@ -48,16 +60,34 @@ public class YandexDiskService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Ошибка при загрузке файла на Яндекс.Диск: {ex.Message}");
+            _logger.LogError(ex, "Ошибка при загрузке файла {FileName} на Яндекс.Диск", fileName);
             return false;
         }
     }
 
-    private async Task<string?> GetUploadUrlAsync(string path)
+    public async Task<bool> FileExistsAsync(BillMetadata metadata, string fileName)
     {
         try
         {
-            var url = $"{ApiBaseUrl}/upload?path={Uri.EscapeDataString(path)}&overwrite=true";
+            var folderPath = $"/{_rootFolder}/{metadata.Year}/{metadata.Month}/{metadata.Company}";
+            var filePath = $"{folderPath}/{fileName}";
+            
+            var url = $"{ApiBaseUrl}?path={Uri.EscapeDataString(filePath)}";
+            var response = await _httpClient.GetAsync(url);
+            
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task<string?> GetUploadUrlAsync(string path, bool overwrite = false)
+    {
+        try
+        {
+            var url = $"{ApiBaseUrl}/upload?path={Uri.EscapeDataString(path)}&overwrite={overwrite.ToString().ToLower()}";
             var response = await _httpClient.GetAsync(url);
             
             if (!response.IsSuccessStatusCode)
@@ -71,7 +101,7 @@ public class YandexDiskService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Ошибка при получении URL для загрузки: {ex.Message}");
+            _logger.LogError(ex, "Ошибка при получении URL для загрузки файла {Path}", path);
             return null;
         }
     }
@@ -94,7 +124,7 @@ public class YandexDiskService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Ошибка при создании папки: {ex.Message}");
+            _logger.LogError(ex, "Ошибка при создании папки {Path}", path);
             return false;
         }
     }
@@ -111,6 +141,23 @@ public class YandexDiskService
         }
         catch
         {
+            return false;
+        }
+    }
+
+    private async Task<bool> DeleteFileAsync(string path)
+    {
+        try
+        {
+            var url = $"{ApiBaseUrl}?path={Uri.EscapeDataString(path)}&permanently=true";
+            var response = await _httpClient.DeleteAsync(url);
+            
+            // 204 - файл удалён, 404 - файл не существует (это ок для нас)
+            return response.IsSuccessStatusCode || response.StatusCode == System.Net.HttpStatusCode.NotFound;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ошибка при удалении файла {Path}", path);
             return false;
         }
     }

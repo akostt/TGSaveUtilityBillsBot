@@ -1,51 +1,54 @@
-using Microsoft.Extensions.Configuration;
-using TGSaveUtilityBillsBot;
-using TGSaveUtilityBillsBot.Services;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using TGSaveUtilityBillsBot.Configuration;
+using TGSaveUtilityBillsBot.Extensions;
 
-// Загружаем конфигурацию
-var configuration = new ConfigurationBuilder()
-    .SetBasePath(Directory.GetCurrentDirectory())
-    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-    .Build();
+var builder = Host.CreateApplicationBuilder(args);
 
-// Получаем настройки
-var botToken = configuration["TelegramBot:Token"];
-var yandexToken = configuration["YandexDisk:Token"];
-var rootFolder = configuration["YandexDisk:RootFolder"];
+// Настройка конфигурации
+builder.Configuration.AddTelegramBotConfiguration();
 
-if (string.IsNullOrEmpty(botToken) || botToken == "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+// Настройка логирования
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
+builder.Logging.AddFilter("System", LogLevel.Warning);
+
+// Регистрация всех сервисов
+builder.Services.AddTelegramBot(builder.Configuration);
+
+var host = builder.Build();
+
+// Получаем и выводим информацию о конфигурации
+var botOptions = host.Services.GetRequiredService<IOptions<TelegramBotOptions>>().Value;
+var allowedUserIds = botOptions.GetAllowedUserIds();
+
+if (allowedUserIds.Count > 0)
 {
-    Console.WriteLine("❌ Ошибка: Токен Telegram бота не настроен!");
-    Console.WriteLine("Отредактируйте appsettings.json и укажите ваш токен бота.");
-    return;
+    Console.WriteLine($"✅ Белый список активен: {allowedUserIds.Count} пользователей");
 }
-
-if (string.IsNullOrEmpty(yandexToken) || yandexToken == "YOUR_YANDEX_DISK_TOKEN_HERE")
+else
 {
-    Console.WriteLine("❌ Ошибка: Токен Яндекс.Диска не настроен!");
-    Console.WriteLine("Отредактируйте appsettings.json и укажите ваш OAuth токен Яндекс.Диска.");
-    return;
+    Console.WriteLine("⚠️  Белый список пуст - бот доступен всем пользователям");
 }
 
 try
 {
-    // Создаем сервисы
-    var yandexDiskService = new YandexDiskService(yandexToken!, rootFolder!);
-    var bot = new TelegramBot(botToken!, yandexDiskService);
-
-    // Обработка Ctrl+C
-    Console.CancelKeyPress += (sender, e) =>
+    await host.RunAsync();
+}
+catch (OptionsValidationException ex)
+{
+    Console.WriteLine("❌ Ошибка конфигурации:");
+    foreach (var failure in ex.Failures)
     {
-        e.Cancel = true;
-        bot.Stop();
-    };
-
-    // Запускаем бота
-    await bot.StartAsync();
+        Console.WriteLine($"  - {failure}");
+    }
 }
 catch (Exception ex)
 {
+    var logger = host.Services.GetRequiredService<ILogger<Program>>();
+    logger.LogCritical(ex, "Критическая ошибка при запуске бота");
     Console.WriteLine($"❌ Критическая ошибка: {ex.Message}");
-    Console.WriteLine(ex.StackTrace);
 }
-

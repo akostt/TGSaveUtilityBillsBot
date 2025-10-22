@@ -1,60 +1,92 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
-using Telegram.Bot.Types.ReplyMarkups;
+using TGSaveUtilityBillsBot.Configuration;
+using TGSaveUtilityBillsBot.Constants;
+using TGSaveUtilityBillsBot.Interfaces;
 using TGSaveUtilityBillsBot.Models;
-using TGSaveUtilityBillsBot.Services;
 
 namespace TGSaveUtilityBillsBot.Handlers;
 
 public class BotHandlers
 {
-    private readonly Dictionary<long, UserState> _userStates = new();
-    private readonly YandexDiskService _yandexDiskService;
+    private readonly IYandexDiskService _yandexDiskService;
+    private readonly IUserStateManager _stateManager;
+    private readonly IKeyboardFactory _keyboardFactory;
+    private readonly ILogger<BotHandlers> _logger;
+    private readonly HashSet<long> _allowedUserIds;
 
-    public BotHandlers(YandexDiskService yandexDiskService)
+    public BotHandlers(
+        IYandexDiskService yandexDiskService,
+        IUserStateManager stateManager,
+        IKeyboardFactory keyboardFactory,
+        ILogger<BotHandlers> logger,
+        IOptions<TelegramBotOptions> botOptions)
     {
         _yandexDiskService = yandexDiskService;
+        _stateManager = stateManager;
+        _keyboardFactory = keyboardFactory;
+        _logger = logger;
+        _allowedUserIds = botOptions.Value.GetAllowedUserIds();
     }
 
     public async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
         try
         {
-            if (update.Type == UpdateType.Message && update.Message != null)
+            // Проверяем доступ пользователя
+            long userId = update.Type switch
             {
-                await HandleMessageAsync(botClient, update.Message, cancellationToken);
-            }
-            else if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery != null)
+                UpdateType.Message when update.Message != null => update.Message.From!.Id,
+                UpdateType.CallbackQuery when update.CallbackQuery != null => update.CallbackQuery.From.Id,
+                _ => 0
+            };
+
+            // Если белый список не пустой и пользователь не в списке - отказываем в доступе
+            if (_allowedUserIds.Count > 0 && !_allowedUserIds.Contains(userId))
             {
-                await HandleCallbackQueryAsync(botClient, update.CallbackQuery, cancellationToken);
+                if (update.Message != null)
+                {
+                    await botClient.SendTextMessageAsync(
+                        update.Message.Chat.Id,
+                        BotMessages.AccessDenied,
+                        cancellationToken: cancellationToken
+                    );
+                }
+                return;
             }
+
+            var handler = update.Type switch
+            {
+                UpdateType.Message when update.Message != null => HandleMessageAsync(botClient, update.Message, cancellationToken),
+                UpdateType.CallbackQuery when update.CallbackQuery != null => HandleCallbackQueryAsync(botClient, update.CallbackQuery, cancellationToken),
+                _ => Task.CompletedTask
+            };
+
+            await handler;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Ошибка при обработке обновления: {ex.Message}");
+            _logger.LogError(ex, "Ошибка при обработке обновления");
         }
     }
 
     private async Task HandleMessageAsync(ITelegramBotClient botClient, Message message, CancellationToken cancellationToken)
     {
-        var chatId = message.Chat.Id;
+        var handler = message.Type switch
+        {
+            MessageType.Text when message.Text?.StartsWith("/") == true => 
+                HandleCommandAsync(botClient, message, cancellationToken),
+            MessageType.Text => 
+                HandleTextMessageAsync(botClient, message, cancellationToken),
+            MessageType.Document when message.Document != null => 
+                HandleDocumentAsync(botClient, message, cancellationToken),
+            _ => Task.CompletedTask
+        };
 
-        if (message.Type == MessageType.Text && message.Text != null)
-        {
-            if (message.Text.StartsWith("/"))
-            {
-                await HandleCommandAsync(botClient, message, cancellationToken);
-            }
-            else
-            {
-                await HandleTextMessageAsync(botClient, message, cancellationToken);
-            }
-        }
-        else if (message.Type == MessageType.Document && message.Document != null)
-        {
-            await HandleDocumentAsync(botClient, message, cancellationToken);
-        }
+        await handler;
     }
 
     private async Task HandleCommandAsync(ITelegramBotClient botClient, Message message, CancellationToken cancellationToken)
@@ -62,107 +94,100 @@ public class BotHandlers
         var chatId = message.Chat.Id;
         var command = message.Text!.ToLower();
 
-        switch (command)
+        var handler = command switch
         {
-            case "/start":
-                await botClient.SendTextMessageAsync(
-                    chatId,
-                    "👋 Добро пожаловать в бот для сохранения квитанций!\n\n" +
-                    "Я помогу вам организовать все ваши коммунальные квитанции на Яндекс.Диске.\n\n" +
-                    "Используйте команду /upload для загрузки квитанции или чека.",
-                    cancellationToken: cancellationToken
-                );
-                break;
+            BotCommands.Start => SendWelcomeMessageAsync(botClient, chatId, cancellationToken),
+            BotCommands.Upload => StartUploadProcessAsync(botClient, chatId, cancellationToken),
+            BotCommands.Cancel => CancelOperationAsync(botClient, chatId, cancellationToken),
+            BotCommands.Help => SendHelpMessageAsync(botClient, chatId, cancellationToken),
+            _ => SendUnknownCommandMessageAsync(botClient, chatId, cancellationToken)
+        };
 
-            case "/upload":
-                _userStates[chatId] = new UserState
-                {
-                    State = UserStateEnum.WaitingForYear,
-                    CurrentBill = new BillMetadata()
-                };
+        await handler;
+    }
 
-                await botClient.SendTextMessageAsync(
-                    chatId,
-                    "📅 Укажите год квитанции (например, 2024):",
-                    cancellationToken: cancellationToken
-                );
-                break;
+    private Task SendWelcomeMessageAsync(ITelegramBotClient botClient, long chatId, CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Пользователь {ChatId} запустил бота", chatId);
+        return botClient.SendTextMessageAsync(chatId, BotMessages.Welcome, cancellationToken: cancellationToken);
+    }
 
-            case "/cancel":
-                if (_userStates.ContainsKey(chatId))
-                {
-                    _userStates.Remove(chatId);
-                }
+    private Task SendHelpMessageAsync(ITelegramBotClient botClient, long chatId, CancellationToken cancellationToken)
+    {
+        return botClient.SendTextMessageAsync(chatId, BotMessages.Help, cancellationToken: cancellationToken);
+    }
 
-                await botClient.SendTextMessageAsync(
-                    chatId,
-                    "❌ Операция отменена.",
-                    cancellationToken: cancellationToken
-                );
-                break;
+    private Task SendUnknownCommandMessageAsync(ITelegramBotClient botClient, long chatId, CancellationToken cancellationToken)
+    {
+        return botClient.SendTextMessageAsync(chatId, BotMessages.InvalidCommand, cancellationToken: cancellationToken);
+    }
 
-            case "/help":
-                await botClient.SendTextMessageAsync(
-                    chatId,
-                    "📖 Доступные команды:\n\n" +
-                    "/start - Начать работу с ботом\n" +
-                    "/upload - Загрузить новую квитанцию\n" +
-                    "/cancel - Отменить текущую операцию\n" +
-                    "/help - Показать эту справку",
-                    cancellationToken: cancellationToken
-                );
-                break;
+    private async Task StartUploadProcessAsync(ITelegramBotClient botClient, long chatId, CancellationToken cancellationToken)
+    {
+        var userState = new UserState
+        {
+            State = UserStateEnum.WaitingForYear,
+            CurrentBill = new BillMetadata()
+        };
 
-            default:
-                await botClient.SendTextMessageAsync(
-                    chatId,
-                    "❓ Неизвестная команда. Используйте /help для просмотра доступных команд.",
-                    cancellationToken: cancellationToken
-                );
-                break;
-        }
+        _stateManager.SetUserState(chatId, userState);
+        _logger.LogInformation("Пользователь {ChatId} начал процесс загрузки", chatId);
+
+        var keyboard = _keyboardFactory.CreateYearKeyboard();
+        await botClient.SendTextMessageAsync(
+            chatId, 
+            BotMessages.AskForYear, 
+            replyMarkup: keyboard,
+            cancellationToken: cancellationToken
+        );
+    }
+
+    private async Task CancelOperationAsync(ITelegramBotClient botClient, long chatId, CancellationToken cancellationToken)
+    {
+        _stateManager.RemoveUserState(chatId);
+        _logger.LogInformation("Пользователь {ChatId} отменил операцию", chatId);
+
+        await botClient.SendTextMessageAsync(chatId, BotMessages.OperationCancelled, cancellationToken: cancellationToken);
     }
 
     private async Task HandleTextMessageAsync(ITelegramBotClient botClient, Message message, CancellationToken cancellationToken)
     {
         var chatId = message.Chat.Id;
 
-        if (!_userStates.TryGetValue(chatId, out var userState))
+        if (!_stateManager.TryGetUserState(chatId, out var userState) || userState == null)
         {
-            await botClient.SendTextMessageAsync(
-                chatId,
-                "Используйте команду /upload для загрузки квитанции.",
-                cancellationToken: cancellationToken
-            );
+            await botClient.SendTextMessageAsync(chatId, BotMessages.UseUploadCommand, cancellationToken: cancellationToken);
             return;
         }
 
-        switch (userState.State)
+        if (userState.State == UserStateEnum.WaitingForManualYear)
         {
-            case UserStateEnum.WaitingForYear:
-                if (int.TryParse(message.Text, out var year) && year >= 2000 && year <= 2100)
-                {
-                    userState.CurrentBill!.Year = year;
-                    userState.State = UserStateEnum.WaitingForMonth;
-
-                    var monthKeyboard = CreateMonthKeyboard();
-                    await botClient.SendTextMessageAsync(
-                        chatId,
-                        "📆 Выберите месяц:",
-                        replyMarkup: monthKeyboard,
-                        cancellationToken: cancellationToken
-                    );
-                }
-                else
-                {
-                    await botClient.SendTextMessageAsync(
-                        chatId,
-                        "❌ Некорректный год. Пожалуйста, введите год (например, 2024):",
-                        cancellationToken: cancellationToken
-                    );
-                }
-                break;
+            await HandleYearInputAsync(botClient, message, userState, cancellationToken);
         }
+    }
+
+    private async Task HandleYearInputAsync(ITelegramBotClient botClient, Message message, UserState userState, CancellationToken cancellationToken)
+    {
+        var chatId = message.Chat.Id;
+
+        if (!int.TryParse(message.Text, out var year) || 
+            year < ValidationRules.MinYear || 
+            year > ValidationRules.MaxYear)
+        {
+            await botClient.SendTextMessageAsync(chatId, BotMessages.InvalidYear, cancellationToken: cancellationToken);
+            return;
+        }
+
+        userState.CurrentBill!.Year = year;
+        userState.State = UserStateEnum.WaitingForMonth;
+
+        var keyboard = _keyboardFactory.CreateMonthKeyboard();
+        await botClient.SendTextMessageAsync(
+            chatId,
+            BotMessages.AskForMonth,
+            replyMarkup: keyboard,
+            cancellationToken: cancellationToken
+        );
     }
 
     private async Task HandleCallbackQueryAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery, CancellationToken cancellationToken)
@@ -172,102 +197,333 @@ public class BotHandlers
 
         await botClient.AnswerCallbackQueryAsync(callbackQuery.Id, cancellationToken: cancellationToken);
 
-        if (!_userStates.TryGetValue(chatId, out var userState))
+        if (!_stateManager.TryGetUserState(chatId, out var userState) || userState == null)
         {
             return;
         }
 
-        if (data.StartsWith("month_"))
+        if (data.StartsWith(CallbackDataPrefixes.Year))
         {
-            var monthValue = int.Parse(data.Replace("month_", ""));
-            userState.CurrentBill!.Month = (Month)monthValue;
-            userState.State = UserStateEnum.WaitingForCompany;
-
-            var companyKeyboard = CreateCompanyKeyboard();
-            await botClient.EditMessageTextAsync(
-                chatId,
-                callbackQuery.Message.MessageId,
-                $"✅ Выбран месяц: {userState.CurrentBill.Month}\n\n🏢 Выберите компанию:",
-                replyMarkup: companyKeyboard,
-                cancellationToken: cancellationToken
-            );
+            await HandleYearSelectionAsync(botClient, callbackQuery, userState, data, cancellationToken);
         }
-        else if (data.StartsWith("company_"))
+        else if (data == CallbackDataPrefixes.ManualYear)
         {
-            var companyName = data.Replace("company_", "");
-            userState.CurrentBill!.Company = Enum.Parse<Company>(companyName);
-            userState.State = UserStateEnum.WaitingForFile;
-
-            await botClient.EditMessageTextAsync(
-                chatId,
-                callbackQuery.Message.MessageId,
-                $"✅ Год: {userState.CurrentBill.Year}\n" +
-                $"✅ Месяц: {userState.CurrentBill.Month}\n" +
-                $"✅ Компания: {userState.CurrentBill.Company}\n\n" +
-                $"📎 Теперь отправьте квитанцию или чек в формате PDF.",
-                cancellationToken: cancellationToken
-            );
+            await HandleManualYearRequestAsync(botClient, callbackQuery, userState, cancellationToken);
         }
+        else if (data.StartsWith(CallbackDataPrefixes.Month))
+        {
+            await HandleMonthSelectionAsync(botClient, callbackQuery, userState, data, cancellationToken);
+        }
+        else if (data.StartsWith(CallbackDataPrefixes.Company))
+        {
+            await HandleCompanySelectionAsync(botClient, callbackQuery, userState, data, cancellationToken);
+        }
+        else if (data.StartsWith(CallbackDataPrefixes.DocumentType))
+        {
+            await HandleDocumentTypeSelectionAsync(botClient, callbackQuery, userState, data, cancellationToken);
+        }
+        else if (data.StartsWith(CallbackDataPrefixes.Overwrite))
+        {
+            await HandleOverwriteAsync(botClient, callbackQuery, userState, cancellationToken);
+        }
+        else if (data.StartsWith(CallbackDataPrefixes.Cancel))
+        {
+            await HandleCancelAsync(botClient, callbackQuery, userState, cancellationToken);
+        }
+    }
+
+    private async Task HandleYearSelectionAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        UserState userState,
+        string callbackData,
+        CancellationToken cancellationToken)
+    {
+        var year = int.Parse(callbackData.Replace(CallbackDataPrefixes.Year, ""));
+        userState.CurrentBill!.Year = year;
+        userState.State = UserStateEnum.WaitingForMonth;
+
+        var keyboard = _keyboardFactory.CreateMonthKeyboard();
+        await botClient.EditMessageTextAsync(
+            callbackQuery.Message!.Chat.Id,
+            callbackQuery.Message.MessageId,
+            BotMessages.AskForMonth,
+            replyMarkup: keyboard,
+            cancellationToken: cancellationToken
+        );
+    }
+
+    private async Task HandleManualYearRequestAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        UserState userState,
+        CancellationToken cancellationToken)
+    {
+        userState.State = UserStateEnum.WaitingForManualYear;
+
+        await botClient.EditMessageTextAsync(
+            callbackQuery.Message!.Chat.Id,
+            callbackQuery.Message.MessageId,
+            BotMessages.AskForManualYear,
+            cancellationToken: cancellationToken
+        );
+    }
+
+    private async Task HandleMonthSelectionAsync(
+        ITelegramBotClient botClient, 
+        CallbackQuery callbackQuery, 
+        UserState userState, 
+        string callbackData, 
+        CancellationToken cancellationToken)
+    {
+        var monthValue = int.Parse(callbackData.Replace(CallbackDataPrefixes.Month, ""));
+        userState.CurrentBill!.Month = (Month)monthValue;
+        userState.State = UserStateEnum.WaitingForCompany;
+
+        var keyboard = _keyboardFactory.CreateCompanyKeyboard();
+        var message = BotMessages.MonthSelected(userState.CurrentBill.Month.ToString());
+
+        await botClient.EditMessageTextAsync(
+            callbackQuery.Message!.Chat.Id,
+            callbackQuery.Message.MessageId,
+            message,
+            replyMarkup: keyboard,
+            cancellationToken: cancellationToken
+        );
+    }
+
+    private async Task HandleCompanySelectionAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        UserState userState,
+        string callbackData,
+        CancellationToken cancellationToken)
+    {
+        var companyName = callbackData.Replace(CallbackDataPrefixes.Company, "");
+        userState.CurrentBill!.Company = Enum.Parse<Company>(companyName);
+        userState.State = UserStateEnum.WaitingForDocumentType;
+
+        var keyboard = _keyboardFactory.CreateDocumentTypeKeyboard();
+        var message = BotMessages.CompanySelected(
+            userState.CurrentBill.Company.ToString().Replace("_", " ")
+        );
+
+        await botClient.EditMessageTextAsync(
+            callbackQuery.Message!.Chat.Id,
+            callbackQuery.Message.MessageId,
+            message,
+            replyMarkup: keyboard,
+            cancellationToken: cancellationToken
+        );
+    }
+
+    private async Task HandleDocumentTypeSelectionAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        UserState userState,
+        string callbackData,
+        CancellationToken cancellationToken)
+    {
+        var documentTypeName = callbackData.Replace(CallbackDataPrefixes.DocumentType, "");
+        userState.CurrentBill!.DocumentType = Enum.Parse<DocumentType>(documentTypeName);
+        userState.State = UserStateEnum.WaitingForFile;
+
+        var message = BotMessages.DocumentTypeSelected(
+            userState.CurrentBill.Year,
+            userState.CurrentBill.Month.ToString(),
+            userState.CurrentBill.Company.ToString().Replace("_", " "),
+            userState.CurrentBill.DocumentType.ToString()
+        );
+
+        var keyboard = _keyboardFactory.CreateCancelKeyboard();
+
+        await botClient.EditMessageTextAsync(
+            callbackQuery.Message!.Chat.Id,
+            callbackQuery.Message.MessageId,
+            message,
+            replyMarkup: keyboard,
+            cancellationToken: cancellationToken
+        );
     }
 
     private async Task HandleDocumentAsync(ITelegramBotClient botClient, Message message, CancellationToken cancellationToken)
     {
         var chatId = message.Chat.Id;
 
-        if (!_userStates.TryGetValue(chatId, out var userState) || 
+        if (!_stateManager.TryGetUserState(chatId, out var userState) || 
+            userState == null ||
             userState.State != UserStateEnum.WaitingForFile)
         {
-            await botClient.SendTextMessageAsync(
-                chatId,
-                "Сначала используйте команду /upload для начала процесса загрузки.",
-                cancellationToken: cancellationToken
-            );
+            await botClient.SendTextMessageAsync(chatId, BotMessages.UseUploadCommandFirst, cancellationToken: cancellationToken);
             return;
         }
 
         var document = message.Document!;
-        
-        // Проверяем, что это PDF файл
-        if (!document.FileName!.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+
+        if (!document.FileName!.EndsWith(ValidationRules.PdfExtension, StringComparison.OrdinalIgnoreCase))
         {
-            await botClient.SendTextMessageAsync(
-                chatId,
-                "❌ Пожалуйста, отправьте файл в формате PDF.",
-                cancellationToken: cancellationToken
-            );
+            await botClient.SendTextMessageAsync(chatId, BotMessages.NotPdfFile, cancellationToken: cancellationToken);
             return;
         }
 
+        await ProcessFileUploadAsync(botClient, chatId, document, userState, cancellationToken);
+    }
+
+    private async Task ProcessFileUploadAsync(
+        ITelegramBotClient botClient,
+        long chatId,
+        Document document,
+        UserState userState,
+        CancellationToken cancellationToken)
+    {
+        Message processingMessage = null!;
+
         try
         {
-            var processingMessage = await botClient.SendTextMessageAsync(
-                chatId,
-                "⏳ Загружаю файл на Яндекс.Диск...",
-                cancellationToken: cancellationToken
-            );
+            processingMessage = await botClient.SendTextMessageAsync(chatId, BotMessages.Uploading, cancellationToken: cancellationToken);
 
-            // Скачиваем файл от Telegram
+            _logger.LogInformation("Загрузка файла {FileName} для пользователя {ChatId}", document.FileName, chatId);
+
             var fileInfo = await botClient.GetFileAsync(document.FileId, cancellationToken);
-            
+
             using var memoryStream = new MemoryStream();
             await botClient.DownloadFileAsync(fileInfo.FilePath!, memoryStream, cancellationToken);
             memoryStream.Position = 0;
 
-            // Загружаем на Яндекс.Диск
-            var success = await _yandexDiskService.UploadFileAsync(
-                userState.CurrentBill!,
-                memoryStream,
-                document.FileName
-            );
+            // Генерируем имя файла на основе типа документа
+            var fileName = userState.CurrentBill!.DocumentType == DocumentType.Квитанция 
+                ? "Квитанция.pdf" 
+                : "Чек.pdf";
 
-            if (success)
+            // Проверяем существование файла
+            var fileExists = await _yandexDiskService.FileExistsAsync(userState.CurrentBill!, fileName);
+
+            if (fileExists)
             {
+                // Сохраняем данные файла для последующей загрузки
+                userState.PendingFileData = memoryStream.ToArray();
+                userState.PendingFilePath = fileName;
+                userState.State = UserStateEnum.WaitingForOverwriteConfirmation;
+
+                var keyboard = _keyboardFactory.CreateOverwriteConfirmationKeyboard();
                 await botClient.EditMessageTextAsync(
                     chatId,
                     processingMessage.MessageId,
-                    $"✅ Квитанция успешно сохранена!\n\n" +
-                    $"📁 Путь: Квитанции/{userState.CurrentBill.Year}/{userState.CurrentBill.Month}/{userState.CurrentBill.Company}/{document.FileName}\n\n" +
-                    $"Используйте /upload для загрузки следующей квитанции.",
+                    BotMessages.FileExists(fileName),
+                    replyMarkup: keyboard,
+                    cancellationToken: cancellationToken
+                );
+                return;
+            }
+
+            var success = await _yandexDiskService.UploadFileAsync(
+                userState.CurrentBill!,
+                memoryStream,
+                fileName,
+                overwrite: false
+            );
+
+            var responseMessage = success
+                ? BotMessages.UploadSuccess(
+                    userState.CurrentBill.Year,
+                    userState.CurrentBill.Month.ToString(),
+                    userState.CurrentBill.Company.ToString().Replace("_", " "),
+                    fileName)
+                : BotMessages.UploadError;
+
+            await botClient.EditMessageTextAsync(chatId, processingMessage.MessageId, responseMessage, cancellationToken: cancellationToken);
+
+            if (success)
+            {
+                _logger.LogInformation("Файл {FileName} успешно загружен для пользователя {ChatId}", document.FileName, chatId);
+            }
+            else
+            {
+                _logger.LogWarning("Не удалось загрузить файл {FileName} для пользователя {ChatId}", document.FileName, chatId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ошибка при обработке файла для пользователя {ChatId}", chatId);
+
+            if (processingMessage != null)
+            {
+                await botClient.EditMessageTextAsync(chatId, processingMessage.MessageId, BotMessages.Error(ex.Message), cancellationToken: cancellationToken);
+            }
+            else
+            {
+                await botClient.SendTextMessageAsync(chatId, BotMessages.Error(ex.Message), cancellationToken: cancellationToken);
+            }
+            
+            // При ошибке удаляем состояние
+            _stateManager.RemoveUserState(chatId);
+        }
+        finally
+        {
+            // Удаляем состояние только если это не ожидание подтверждения перезаписи
+            if (!_stateManager.TryGetUserState(chatId, out var state) || 
+                state == null || 
+                state.State != UserStateEnum.WaitingForOverwriteConfirmation)
+            {
+                _stateManager.RemoveUserState(chatId);
+            }
+        }
+    }
+
+    private async Task HandleOverwriteAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        UserState userState,
+        CancellationToken cancellationToken)
+    {
+        var chatId = callbackQuery.Message!.Chat.Id;
+
+        if (userState.PendingFileData == null || userState.PendingFilePath == null)
+        {
+            await botClient.EditMessageTextAsync(
+                chatId,
+                callbackQuery.Message.MessageId,
+                "❌ Ошибка: данные файла не найдены. Попробуйте загрузить файл снова.",
+                cancellationToken: cancellationToken
+            );
+            _stateManager.RemoveUserState(chatId);
+            return;
+        }
+
+        var fileName = userState.PendingFilePath;
+
+        try
+        {
+            // Показываем, что началась перезапись
+            await botClient.EditMessageTextAsync(
+                chatId,
+                callbackQuery.Message.MessageId,
+                BotMessages.Overwriting,
+                cancellationToken: cancellationToken
+            );
+
+            // Небольшая задержка для лучшего UX
+            await Task.Delay(300, cancellationToken);
+
+            // Выполняем перезапись
+            using var memoryStream = new MemoryStream(userState.PendingFileData);
+
+            var success = await _yandexDiskService.UploadFileAsync(
+                userState.CurrentBill!,
+                memoryStream,
+                fileName,
+                overwrite: true
+            );
+            if (success)
+            {
+                var responseMessage = $"✅ Файл успешно перезаписан!\n\n" +
+                    $"📁 Путь: Квитанции/{userState.CurrentBill.Year}/{userState.CurrentBill.Month}/{userState.CurrentBill.Company}/{fileName}\n\n" +
+                    $"Используйте /upload для загрузки следующего документа.";
+
+                await botClient.EditMessageTextAsync(
+                    chatId,
+                    callbackQuery.Message.MessageId,
+                    responseMessage,
                     cancellationToken: cancellationToken
                 );
             }
@@ -275,71 +531,49 @@ public class BotHandlers
             {
                 await botClient.EditMessageTextAsync(
                     chatId,
-                    processingMessage.MessageId,
-                    "❌ Ошибка при загрузке файла на Яндекс.Диск. Проверьте токен доступа и попробуйте снова.",
+                    callbackQuery.Message.MessageId,
+                    BotMessages.UploadError,
                     cancellationToken: cancellationToken
                 );
             }
-
-            // Очищаем состояние пользователя
-            _userStates.Remove(chatId);
         }
         catch (Exception ex)
         {
-            await botClient.SendTextMessageAsync(
+            _logger.LogError(ex, "Ошибка при перезаписи файла для пользователя {ChatId}", chatId);
+            await botClient.EditMessageTextAsync(
                 chatId,
-                $"❌ Произошла ошибка: {ex.Message}",
+                callbackQuery.Message.MessageId,
+                BotMessages.Error(ex.Message),
                 cancellationToken: cancellationToken
             );
-            _userStates.Remove(chatId);
+        }
+        finally
+        {
+            _stateManager.RemoveUserState(chatId);
         }
     }
 
-    private InlineKeyboardMarkup CreateMonthKeyboard()
+    private async Task HandleCancelAsync(
+        ITelegramBotClient botClient,
+        CallbackQuery callbackQuery,
+        UserState userState,
+        CancellationToken cancellationToken)
     {
-        var buttons = new List<List<InlineKeyboardButton>>();
-        var months = Enum.GetValues<Month>();
+        var chatId = callbackQuery.Message!.Chat.Id;
 
-        for (int i = 0; i < months.Length; i += 3)
-        {
-            var row = new List<InlineKeyboardButton>();
-            for (int j = i; j < Math.Min(i + 3, months.Length); j++)
-            {
-                var month = months[j];
-                row.Add(InlineKeyboardButton.WithCallbackData(
-                    month.ToString(),
-                    $"month_{(int)month}"
-                ));
-            }
-            buttons.Add(row);
-        }
+        await botClient.EditMessageTextAsync(
+            chatId,
+            callbackQuery.Message.MessageId,
+            BotMessages.OperationCancelled + "\n\nИспользуйте /upload для новой загрузки.",
+            cancellationToken: cancellationToken
+        );
 
-        return new InlineKeyboardMarkup(buttons);
-    }
-
-    private InlineKeyboardMarkup CreateCompanyKeyboard()
-    {
-        var buttons = new List<List<InlineKeyboardButton>>();
-        var companies = Enum.GetValues<Company>();
-
-        foreach (var company in companies)
-        {
-            buttons.Add(new List<InlineKeyboardButton>
-            {
-                InlineKeyboardButton.WithCallbackData(
-                    company.ToString().Replace("_", " "),
-                    $"company_{company}"
-                )
-            });
-        }
-
-        return new InlineKeyboardMarkup(buttons);
+        _stateManager.RemoveUserState(chatId);
     }
 
     public Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
     {
-        Console.WriteLine($"Ошибка Telegram API: {exception.Message}");
+        _logger.LogError(exception, "Ошибка Telegram API");
         return Task.CompletedTask;
     }
 }
-
