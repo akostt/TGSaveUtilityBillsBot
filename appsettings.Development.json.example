@@ -1,0 +1,10 @@
+{
+  "TelegramBot": {
+    "Token": "ВАШ_TELEGRAM_BOT_TOKEN"
+  },
+  "YandexDisk": {
+    "Token": "ВАШ_YANDEX_DISK_TOKEN",
+    "RootFolder": "Квитанции"
+  }
+}
+
