@@ -35,7 +35,6 @@ artifacts/
 appsettings.Development.json
 appsettings.*.json
 !appsettings.json
-!appsettings.Development.json.example
 
 # Environment variables
 .env

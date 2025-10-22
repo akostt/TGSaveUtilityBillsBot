@@ -64,7 +64,8 @@ cp .env.example .env && make up
 
 **Без Docker:**
 ```bash
-cp appsettings.Development.json.example appsettings.Development.json && dotnet run
+# Создайте appsettings.Development.json с вашими токенами, затем:
+dotnet run
 ```
 
 > 📖 Полная инструкция: [QUICKSTART.md](QUICKSTART.md)  
@@ -135,7 +136,7 @@ TGSaveUtilityBillsBot/
 └── README.md                # Этот файл
 ```
 
-> 📊 **Статистика:** 26 C# файлов, ~1200 строк кода
+> 📊 **Статистика:** 29 C# файлов, ~1460 строк кода
 
 ## Архитектура
 

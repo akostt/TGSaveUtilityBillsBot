@@ -62,10 +62,7 @@ ALLOWED_USER_IDS=123456789,987654321
 ### Вариант B: Запуск без Docker
 
 ```bash
-# Скопируйте пример
-cp appsettings.Development.json.example appsettings.Development.json
-
-# Отредактируйте файл
+# Создайте файл конфигурации
 nano appsettings.Development.json
 ```
 

@@ -63,8 +63,10 @@ environment:
 
 ### Создание файла конфигурации
 
+Создайте файл `appsettings.Development.json` в корне проекта:
+
 ```bash
-cp appsettings.Development.json.example appsettings.Development.json
+nano appsettings.Development.json
 ```
 
 ### Формат appsettings.Development.json
@@ -111,8 +113,7 @@ cp appsettings.Development.json.example appsettings.Development.json
 
 | Файл | Назначение | В Git | Содержит секреты |
 |------|------------|-------|------------------|
-| `appsettings.json` | Базовая конфигурация | ✅ Да | ❌ Нет |
-| `appsettings.Development.json.example` | Пример для локальной разработки | ✅ Да | ❌ Нет |
+| `appsettings.json` | Базовая конфигурация (логирование, настройки по умолчанию) | ✅ Да | ❌ Нет |
 | `appsettings.Development.json` | **Ваши токены** (локально) | ❌ Нет | ⚠️ **Да** |
 | `.env.example` | Пример для Docker | ✅ Да | ❌ Нет |
 | `.env` | **Ваши токены** (Docker) | ❌ Нет | ⚠️ **Да** |
